@@ -110,12 +110,22 @@ SYSTEM_INSTRUCTION = """
 def get_polar_data():
     if POLAR_ACCESS_TOKEN:
         try:
-            res = requests.get(
-                "https://www.polaraccesslink.com/v3/exercises",
-                headers={"Authorization": f"Bearer {POLAR_ACCESS_TOKEN}", "Accept": "application/json"}
-            )
-            if res.status_code == 200:
-                return res.json()
+            headers = {"Authorization": f"Bearer {POLAR_ACCESS_TOKEN}", "Accept": "application/json"}
+            
+            # 1. Данные о тренировках
+            exercises = requests.get("https://www.polaraccesslink.com/v3/exercises", headers=headers)
+            
+            # 2. Фазы и продолжительность сна
+            sleep = requests.get("https://www.polaraccesslink.com/v3/users/nights", headers=headers)
+            
+            # 3. Восстановление (Nightly Recharge / HRV)
+            recharge = requests.get("https://www.polaraccesslink.com/v3/users/nightly-recharge", headers=headers)
+
+            return {
+                "exercises": exercises.json() if exercises.status_code == 200 else [],
+                "sleep": sleep.json() if sleep.status_code == 200 else {},
+                "recharge": recharge.json() if recharge.status_code == 200 else {}
+            }
         except Exception as e:
             print(f"Ошибка получения данных Polar: {e}")
     return None
