@@ -2,7 +2,8 @@ import io
 import json
 import os
 import requests
-import nest_asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from google import genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -10,9 +11,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaInMemoryUpload
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-nest_asyncio.apply()
-
-# --- ПОЛУЧЕНИЕ ПЕРЕМЕННЫХ ИЗ НАСТРОЕК СЕРВЕРА ---
+# --- ПОЛУЧЕНИЕ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ИЗ НАСТРОЕК СЕРВЕРА ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -22,8 +21,26 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
 FILE_NAME = "ski_coach_memory.json"
 
+# --- ВЕБ-СЕРВЕР ПРОВЕРКИ ЗДОРОВЬЯ ДЛЯ БЕСПЛАТНОГО WEB SERVICE НА RENDER ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        return  # Отключаем лишний спам-лог запросов сервера в консоли
+
+def run_health_check_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+
 # --- РАБОТА С GOOGLE DRIVE API ---
 def get_drive_service():
+    if not GOOGLE_CREDENTIALS_JSON:
+        print("⚠️ Переменная GOOGLE_CREDENTIALS не задана!")
+        return None
     info = json.loads(GOOGLE_CREDENTIALS_JSON)
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=['https://www.googleapis.com/auth/drive']
@@ -33,6 +50,9 @@ def get_drive_service():
 def load_memory_from_drive():
     try:
         service = get_drive_service()
+        if not service or not DRIVE_FOLDER_ID:
+            return []
+
         query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
         results = service.files().list(q=query, fields="files(id)").execute()
         files = results.get('files', [])
@@ -47,7 +67,7 @@ def load_memory_from_drive():
         done = False
         while not done:
             _, done = downloader.next_chunk()
-        
+
         fh.seek(0)
         return json.loads(fh.read().decode('utf-8'))
     except Exception as e:
@@ -57,6 +77,9 @@ def load_memory_from_drive():
 def save_memory_to_drive(history):
     try:
         service = get_drive_service()
+        if not service or not DRIVE_FOLDER_ID:
+            return
+
         query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
         results = service.files().list(q=query, fields="files(id)").execute()
         files = results.get('files', [])
@@ -70,26 +93,31 @@ def save_memory_to_drive(history):
         else:
             file_metadata = {'name': FILE_NAME, 'parents': [DRIVE_FOLDER_ID]}
             service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        print("✅ Память успешно сохранена на Google Диск!")
+        print("✅ Память успешно синхронизирована с Google Диском!")
     except Exception as e:
         print(f"Ошибка сохранения памяти на Google Диск: {e}")
 
-# --- ИИ-ТРЕНЕР И TELEGRAM ---
+# --- ИИ-ТРЕНЕР И POLAR FLOW ---
 SYSTEM_INSTRUCTION = """
 Ты — личный элитный тренер по лыжному ориентированию. Твой спортсмен — КМС (2011 г.р.), кандидат в юниорскую сборную России.
-Учитывай специфику вида спорта: работу одновременным и попеременным ходами, сетку лыжней, пульсовые зоны, лактат и чтение карты на высокой ЧСС.
+Учитывай специфику вида спорта:
+- Высокая физическая нагрузка (работа одновременным бесшажным и попеременным ходами на сетке лыжней различной ширины).
+- Динамика пульсовых зон, контроль закисления, восстановление плечевого пояса и ног.
+- Ментальная свежесть для чтения карты и принятия решений по выбору варианта на высокой ЧСС (180+).
+- Твой тон: профессиональный, требовательный, мотивирующий, но с фокусом на здоровье и долгосрочный прогресс атлета.
 """
-
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 def get_polar_data():
     if POLAR_ACCESS_TOKEN:
-        res = requests.get(
-            "https://www.polaraccesslink.com/v3/exercises",
-            headers={"Authorization": f"Bearer {POLAR_ACCESS_TOKEN}", "Accept": "application/json"}
-        )
-        if res.status_code == 200:
-            return res.json()
+        try:
+            res = requests.get(
+                "https://www.polaraccesslink.com/v3/exercises",
+                headers={"Authorization": f"Bearer {POLAR_ACCESS_TOKEN}", "Accept": "application/json"}
+            )
+            if res.status_code == 200:
+                return res.json()
+        except Exception as e:
+            print(f"Ошибка получения данных Polar: {e}")
     return None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -100,13 +128,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = load_memory_from_drive()
 
     polar_context = ""
-    if any(w in user_text.lower() for w in ["тренировк", "polar", "пульс", "состояни", "анализ", "разбор"]):
+    if any(w in user_text.lower() for w in ["тренировк", "polar", "пульс", "состояни", "анализ", "разбор", "самочувстви"]):
         data = get_polar_data()
         if data:
             polar_context = f"\n[Свежие данные Polar Flow: {json.dumps(data, ensure_ascii=False)}]\n"
 
-    full_prompt = f"{SYSTEM_INSTRUCTION}\nИстория:\n{json.dumps(history, ensure_ascii=False)}\n{polar_context}\nСпортсмен: {user_text}"
+    full_prompt = f"{SYSTEM_INSTRUCTION}\nИстория диалога:\n{json.dumps(history, ensure_ascii=False)}\n{polar_context}\nСпортсмен: {user_text}"
 
+    ai_client = genai.Client(api_key=GEMINI_API_KEY)
     response = ai_client.models.generate_content(
         model="gemini-3.6-flash",
         contents=full_prompt
@@ -119,10 +148,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(answer)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот-тренер работает 24/7! Данные синхронизируются с Google Диском.")
+    await update.message.reply_text("Привет! Я твой ИИ-тренер по лыжному ориентированию (работает 24/7 в облаке). Задавай вопросы или запрашивай разбор Polar!")
 
 if __name__ == "__main__":
+    # 1. Запуск веб-сервера для Render
+    threading.Thread(target=run_health_check_server, daemon=True).start()
+    print("🚀 Фоновый веб-сервер проверки состояния запущен.")
+
+    # 2. Запуск Telegram-бота
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("🚀 Бот-тренер успешно запущен в режиме 24/7!")
     app.run_polling()
