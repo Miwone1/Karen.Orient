@@ -86,7 +86,7 @@ def load_memory_from_drive():
         files = results.get('files', [])
 
         if not files:
-            print(f"ℹ️ Файл {FILE_NAME} пока не найден на Диске. Будет создан новый.")
+            print(f"ℹ️ Файл {FILE_NAME} пока не найден на Диске. Будет создан новый при первом сообщении.")
             return []
 
         file_id = files[0]['id']
@@ -100,13 +100,14 @@ def load_memory_from_drive():
         return []
 
 def save_memory_to_drive(history):
+    """Сохраняет массив сообщений обратно на Google Диск."""
     try:
         service = get_drive_service()
         if not service:
-            print("❌ Ошибка записи: не удалось подключить get_drive_service()")
+            print("❌ Ошибка записи: сервис Google Drive не инициализирован.")
             return
         if not DRIVE_FOLDER_ID:
-            print("❌ Ошибка записи: переменная DRIVE_FOLDER_ID не задана в Render!")
+            print("❌ Ошибка записи: переменная DRIVE_FOLDER_ID не задана!")
             return
 
         query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
@@ -118,8 +119,8 @@ def save_memory_to_drive(history):
         ).execute()
         files = results.get('files', [])
 
-        data_str = json.dumps(history, ensure_ascii=False, indent=2)
-        media = MediaInMemoryUpload(data_str.encode('utf-8'), mimetype='application/json')
+        data_bytes = json.dumps(history, ensure_ascii=False, indent=2).encode('utf-8')
+        media = MediaInMemoryUpload(data_bytes, mimetype='application/json', resumable=True)
 
         if files:
             file_id = files[0]['id']
@@ -128,7 +129,7 @@ def save_memory_to_drive(history):
                 media_body=media,
                 supportsAllDrives=True
             ).execute()
-            print(f"✅ Память обновлена в существующем файле на Google Диске! (ID: {file_id})")
+            print(f"✅ [Google Drive] Память успешно обновлена (ID файла: {file_id})")
         else:
             file_metadata = {
                 'name': FILE_NAME, 
@@ -140,7 +141,7 @@ def save_memory_to_drive(history):
                 fields='id',
                 supportsAllDrives=True
             ).execute()
-            print(f"🎉 Новый файл {FILE_NAME} СОЗДАН на Google Диске! (ID: {new_file.get('id')})")
+            print(f"🎉 [Google Drive] Создан новый файл памяти! (ID: {new_file.get('id')})")
     except Exception as e:
         print(f"❌ Ошибка сохранения памяти на Google Диск: {e}")
 
@@ -200,6 +201,8 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = f"Данные с Polar Flow: получено тренировок: {len(exercises)}.\n" + json.dumps(exercises, ensure_ascii=False, indent=2)
     
     user_memory.append({"role": "user", "parts": [{"text": f"[Системное сообщение] Проанализируй свежие данные тренировки: {summary}"}]})
+    
+    # Сохраняем в фоне
     save_memory_to_drive(user_memory)
 
     recent_history = user_memory[-30:]
@@ -228,7 +231,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ошибка: GEMINI_API_KEY не задан.")
         return
 
+    # Добавляем новое сообщение
     user_memory.append({"role": "user", "parts": [{"text": user_text}]})
+    
+    # Сразу пробуем записать на диск
+    save_memory_to_drive(user_memory)
+
     recent_history = user_memory[-30:]
 
     try:
@@ -254,7 +262,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     Thread(target=run_health_check_server, daemon=True).start()
 
-    print("⏳ Тестирование подключения к Google Диску...")
+    print("⏳ Проверка прав доступа к Google Диску...")
     save_memory_to_drive(user_memory)
 
     if not TELEGRAM_BOT_TOKEN:
@@ -266,5 +274,5 @@ if __name__ == "__main__":
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
         print("🚀 Бот-тренер успешно запущен в режиме 24/7!")
-        app.run_polling()
+        app.run_polling(drop_pending_updates=True)
         
