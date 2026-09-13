@@ -187,20 +187,18 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Новые тренировки в Polar не найдены или возникла ошибка доступа.")
         return
 
-    # Сохраняем поступившие данные в глобальную память (чтобы бот помнил их всегда)
+    # Сохраняем поступившие данные в глобальную память
     summary_data = json.dumps(exercises, ensure_ascii=False, indent=2)
     user_memory.append({
         "role": "user", 
         "parts": [{"text": f"[Системные данные Polar] Загружена тренировка:\n{summary_data}"}]
     })
     
-    # Также сохраняем фиктивный ответ модели, чтобы диалоговая цепочка Gemini была валидной
     user_memory.append({
         "role": "model", 
         "parts": [{"text": "Данные тренировки успешно сохранены в память."}]
     })
 
-    # Записываем обновленную память на Google Диск
     save_memory_to_drive(user_memory)
 
     count = len(exercises) if isinstance(exercises, list) else 1
@@ -220,28 +218,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1. Записываем вопрос пользователя
     user_memory.append({"role": "user", "parts": [{"text": user_text}]})
     
-    # Для контекста AI берем последние 40 записей из всей накопившейся истории
+    # Для контекста AI берем последние 40 записей
     recent_history = user_memory[-40:]
 
-    try:
-        response = ai_client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=recent_history,
-            config=types.GenerateContentConfig(system_instruction=system_instruction)
-        )
-        bot_reply = response.text
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = ai_client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=recent_history,
+                config=types.GenerateContentConfig(system_instruction=system_instruction)
+            )
+            bot_reply = response.text
 
-        # 2. Записываем ответ AI
-        user_memory.append({"role": "model", "parts": [{"text": bot_reply}]})
-        
-        # 3. Синхронизируем весь массив на Google Диск
-        save_memory_to_drive(user_memory)
+            # 2. Записываем ответ AI
+            user_memory.append({"role": "model", "parts": [{"text": bot_reply}]})
+            
+            # 3. Синхронизируем весь массив на Google Диск
+            save_memory_to_drive(user_memory)
 
-        await update.message.reply_text(bot_reply)
+            await update.message.reply_text(bot_reply)
+            break
 
-    except Exception as e:
-        print(f"❌ Ошибка вызова Gemini API: {e}")
-        await update.message.reply_text("Произошла ошибка при обработке запроса.")
+        except Exception as e:
+            error_str = str(e)
+            print(f"❌ Ошибка вызова Gemini API (попытка {attempt + 1}): {error_str}")
+            
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** (attempt + 1))
+                    continue
+                else:
+                    await update.message.reply_text("⏳ Превышен лимит запросов к AI. Подожди 1 минуту и спроси снова!")
+            else:
+                await update.message.reply_text("Произошла ошибка при обработке запроса.")
+                break
 
 # ================================
 # MAIN ENTRY POINT
