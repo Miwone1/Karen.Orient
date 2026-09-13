@@ -3,6 +3,7 @@ import json
 import os
 import requests
 import threading
+import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from google import genai
 from google.genai import types
@@ -10,7 +11,12 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaInMemoryUpload
 from telegram import Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+
+# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.getLogger("telegram.ext").setLevel(logging.ERROR)
 
 # --- ПОЛУЧЕНИЕ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ИЗ НАСТРОЕК СЕРВЕРА ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -121,8 +127,7 @@ def test_drive_connection():
     print("⏳ Тестирование подключения к Google Диску...")
     initial_memory = load_memory_from_drive()
     if not initial_memory:
-        # Если файл еще не создан, создаем инициализирующую запись
-        test_history = [{"system": "Инициализация памяти бота-тренера"}]
+        test_history = [{"system": "Инициализация памяти бота-тренера прошла успешно"}]
         save_memory_to_drive(test_history)
 
 # --- ИИ-ТРЕНЕР И POLAR FLOW ---
@@ -177,12 +182,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3. Превращение ВСЕЙ истории переписки в читаемый диалоговый текст
     formatted_history = ""
     for turn in history:
-        if "user" in turn and "coach" in turn:
+        if isinstance(turn, dict) and "user" in turn and "coach" in turn:
             formatted_history += f"Спортсмен: {turn.get('user', '')}\nТренер: {turn.get('coach', '')}\n\n"
 
     full_prompt = f"Предыдущий диалог:\n{formatted_history}\n{polar_context}\nСпортсмен: {user_text}"
 
-    # 4. Отправка запроса в Gemini с обработкой квот и ошибок
+    # 4. Отправка запроса в Gemini с обработкой ошибок
     try:
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
         response = ai_client.models.generate_content(
@@ -198,9 +203,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         err_msg = str(e)
         print(f"❌ Ошибка Gemini API: {err_msg}")
         if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            await update.message.reply_text("⚠️ Достигнут лимит запросов к Gemini 3.6 Flash (20 в день). Подожди сброса квоты или смени модель на стандартную Flash.")
+            await update.message.reply_text("⚠️ Достигнут суточный лимит запросов к Gemini 3.6 Flash (20 в день). Подожди сброса квоты или укажи стандартную Flash-модель в коде.")
         else:
-            await update.message.reply_text("⚠️ Произошла ошибка при генерации ответа тренера. Проверь консоль серверов.")
+            await update.message.reply_text("⚠️ Ошибка при генерации ответа тренера. Подробности в логах сервера.")
         return
 
     # 5. Добавление нового ответа и сохранение истории на Google Диск
@@ -212,18 +217,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я твой ИИ-тренер по лыжному ориентированию (работает 24/7 в облаке). Задавай вопросы или запрашивай разбор Polar!")
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик ошибок Telegram-бота"""
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        print("⚠️ Временный сетевой сбой Telegram API (Bad Gateway / Timeout). Повторное подключение...")
+        return
+    
+    print(f"❌ Ошибка в обработчике Telegram: {err}")
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("⚠️ Произошла ошибка при обработке запроса. Подробности в логах сервера.")
+        except Exception:
+            pass
+
 if __name__ == "__main__":
-    # 1. Запуск веб-сервера проверки работоспособности для Render
+    # 1. Запуск веб-сервера проверки состояния для Render
     threading.Thread(target=run_health_check_server, daemon=True).start()
     print("🚀 Фоновый веб-сервер проверки состояния запущен.")
 
-    # 2. Проверка Google Диска прямо при старте бота
+    # 2. Автоматическая проверка создания файла на Google Диске прямо при старте
     test_drive_connection()
 
     # 3. Запуск Telegram-бота
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Регистрация обработчика ошибок
+    app.add_error_handler(error_handler)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("🚀 Бот-тренер успешно запущен в режиме 24/7!")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
