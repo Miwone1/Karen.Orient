@@ -28,7 +28,7 @@ logging.basicConfig(
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 POLAR_ACCESS_TOKEN = os.environ.get("POLAR_ACCESS_TOKEN")
 
 FILE_NAME = "ski_coach_memory.json"
