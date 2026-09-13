@@ -8,7 +8,7 @@ from threading import Thread
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaInMemoryUpload
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -33,7 +33,7 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 POLAR_ACCESS_TOKEN = os.environ.get("POLAR_ACCESS_TOKEN")
 
 FILE_NAME = "ski_coach_memory.json"
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
+SCOPES = ['https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive']
 
 # ================================
 # HEALTH CHECK SERVER (FOR RENDER)
@@ -69,28 +69,34 @@ def get_drive_service():
         print(f"❌ Ошибка авторизации Google Drive API: {e}")
         return None
 
-def load_memory_from_drive():
+def find_memory_file(service):
+    """Надёжный поиск файла по имени во всех доступных папках."""
     try:
-        service = get_drive_service()
-        if not service or not DRIVE_FOLDER_ID:
-            print("⚠️ DRIVE_FOLDER_ID не задан. Бот работает без постоянной памяти.")
-            return []
-
-        # Ищем файл в указанной папке
-        query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
+        # Ищем файл по точному имени без привязки к родительской папке
+        query = f"name='{FILE_NAME}' and trashed=false"
         results = service.files().list(
             q=query, 
-            fields="files(id)",
+            fields="files(id, name, mimeType)",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True
         ).execute()
         files = results.get('files', [])
+        return files[0]['id'] if files else None
+    except Exception as e:
+        print(f"❌ Ошибка при поиске файла на Диске: {e}")
+        return None
 
-        if not files:
-            print(f"ℹ️ Файл {FILE_NAME} пока не найден в папке. Проверь имя файла и доступ.")
+def load_memory_from_drive():
+    try:
+        service = get_drive_service()
+        if not service:
             return []
 
-        file_id = files[0]['id']
+        file_id = find_memory_file(service)
+        if not file_id:
+            print(f"ℹ️ Файл {FILE_NAME} не найден на Диске.")
+            return []
+
         request = service.files().get_media(fileId=file_id)
         file_content = request.execute()
         
@@ -106,36 +112,26 @@ def load_memory_from_drive():
         return []
 
 def save_memory_to_drive(history):
-    """Сохраняет массив сообщений поверх существующего файла."""
+    """Сохраняет массив сообщений поверх найденного файла."""
     try:
         service = get_drive_service()
-        if not service or not DRIVE_FOLDER_ID:
+        if not service:
             return
 
-        # Ищем файл, созданный пользователем
-        query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
-        results = service.files().list(
-            q=query, 
-            fields="files(id)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
-        files = results.get('files', [])
+        file_id = find_memory_file(service)
 
         data_bytes = json.dumps(history, ensure_ascii=False, indent=2).encode('utf-8')
         media = MediaInMemoryUpload(data_bytes, mimetype='application/json', resumable=False)
 
-        if files:
-            file_id = files[0]['id']
-            # Обновляем содержимое файла
+        if file_id:
             service.files().update(
                 fileId=file_id, 
                 media_body=media,
                 supportsAllDrives=True
             ).execute()
-            print(f"✅ [Google Drive] Память записана в файл ID: {file_id}")
+            print(f"✅ [Google Drive] Память успешно сохранена в файл ID: {file_id}")
         else:
-            print(f"⚠️ Файл {FILE_NAME} не найден в папке {DRIVE_FOLDER_ID}. Некуда записывать.")
+            print(f"⚠️ Файл {FILE_NAME} не найден. Убедись, что файл с таким именем есть на Диске.")
     except Exception as e:
         print(f"❌ Ошибка сохранения памяти на Google Диск: {e}")
 
@@ -146,7 +142,6 @@ user_memory = load_memory_from_drive()
 # POLAR ACCESSLINK INTEGRATION
 # ================================
 def fetch_polar_exercises():
-    """Получает последние данные о тренировках через Polar AccessLink API."""
     if not POLAR_ACCESS_TOKEN:
         print("⚠️ POLAR_ACCESS_TOKEN не настроен.")
         return None
@@ -184,21 +179,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я твой AI-тренер по лыжным гонкам и ориентированию. Напиши мне или используй команду /sync для получения данных из Polar.")
 
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /sync для загрузки тренировок Polar."""
     await update.message.reply_text("⏳ Запрашиваю последние тренировки из Polar Flow...")
     exercises = fetch_polar_exercises()
     
     if not exercises:
-        await update.message.reply_text("❌ Не удалось получить новые тренировки из Polar (проверьте POLAR_ACCESS_TOKEN или новые тренировки отсутствуют).")
+        await update.message.reply_text("❌ Не удалось получить новые тренировки из Polar.")
         return
 
     summary = f"Данные с Polar Flow: получено тренировок: {len(exercises)}.\n" + json.dumps(exercises, ensure_ascii=False, indent=2)
-    
     user_memory.append({"role": "user", "parts": [{"text": f"[Системное сообщение] Проанализируй свежие данные тренировки: {summary}"}]})
     
-    # Сохраняем в фоне
     save_memory_to_drive(user_memory)
-
     recent_history = user_memory[-30:]
 
     try:
@@ -214,7 +205,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(bot_reply)
     except Exception as e:
-        print(f"❌ Ошибка вызова Gemini API при синхронизации Polar: {e}")
+        print(f"❌ Ошибка вызова Gemini API: {e}")
         await update.message.reply_text("Произошла ошибка при анализе тренировки.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -225,10 +216,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ошибка: GEMINI_API_KEY не задан.")
         return
 
-    # Добавляем новое сообщение
     user_memory.append({"role": "user", "parts": [{"text": user_text}]})
-    
-    # Сразу пробуем записать на диск
     save_memory_to_drive(user_memory)
 
     recent_history = user_memory[-30:]
@@ -248,7 +236,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         print(f"❌ Ошибка вызова Gemini API: {e}")
-        await update.message.reply_text("Произошла ошибка при обработке запроса к AI. Попробуй позже.")
+        await update.message.reply_text("Произошла ошибка при обработке запроса к AI.")
 
 # ================================
 # MAIN ENTRY POINT
