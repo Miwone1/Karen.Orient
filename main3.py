@@ -1,61 +1,67 @@
-import io
-import json
 import os
-import requests
-import threading
+import json
 import logging
+import asyncio
+import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from google import genai
-from google.genai import types
+from threading import Thread
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaInMemoryUpload
+from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
+
 from telegram import Update
-from telegram.error import NetworkError, TimedOut
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+from google import genai
 
-# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logging.getLogger("telegram.ext").setLevel(logging.ERROR)
+# ================================
+# LOGGING SETUP
+# ================================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# --- ПОЛУЧЕНИЕ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ИЗ НАСТРОЕК СЕРВЕРА ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-POLAR_ACCESS_TOKEN = os.getenv("POLAR_ACCESS_TOKEN")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "").strip().strip("'").strip('"')
+# ================================
+# CONFIG & ENVs
+# ================================
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+POLAR_ACCESS_TOKEN = os.environ.get("POLAR_ACCESS_TOKEN")
 
 FILE_NAME = "ski_coach_memory.json"
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
-# --- ВЕБ-СЕРВЕР ПРОВЕРКИ ЗДОРОВЬЯ ДЛЯ БЕСПЛАТНОГО WEB SERVICE НА RENDER ---
+# ================================
+# HEALTH CHECK SERVER (FOR RENDER)
+# ================================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, format, *args):
-        return  # Отключаем лишний спам-лог запросов сервера в консоли
+        self.wfile.write("Бот-тренер работает в 24/7 режиме!".encode('utf-8'))
 
 def run_health_check_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
+    port = int(os.environ.get("PORT", 8080))
+    server_address = ('', port)
+    httpd = HTTPServer(server_address, HealthCheckHandler)
+    print(f"🚀 Фоновый веб-сервер проверки состояния запущен на порту {port}")
+    httpd.serve_forever()
 
-# --- РАБОТА С GOOGLE DRIVE API ---
+# ================================
+# GOOGLE DRIVE INTEGRATION
+# ================================
 def get_drive_service():
     if not GOOGLE_CREDENTIALS_JSON:
-        print("⚠️ Переменная GOOGLE_CREDENTIALS не задана!")
+        print("⚠️ Переменная GOOGLE_CREDENTIALS_JSON не найдена.")
         return None
     try:
-        info = json.loads(GOOGLE_CREDENTIALS_JSON)
-        # Исправление переносов строк в приватном ключе для Render
-        if "private_key" in info:
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
-            
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
         creds = service_account.Credentials.from_service_account_info(
-            info, scopes=['https://www.googleapis.com/auth/drive']
+            creds_dict, scopes=SCOPES
         )
         return build('drive', 'v3', credentials=creds)
     except Exception as e:
@@ -66,11 +72,15 @@ def load_memory_from_drive():
     try:
         service = get_drive_service()
         if not service or not DRIVE_FOLDER_ID:
-            print("⚠️ Пропуск загрузки с Диска: не настроен service или DRIVE_FOLDER_ID")
             return []
 
         query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
-        results = service.files().list(q=query, fields="files(id)").execute()
+        results = service.files().list(
+            q=query, 
+            fields="files(id)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
         files = results.get('files', [])
 
         if not files:
@@ -79,18 +89,12 @@ def load_memory_from_drive():
 
         file_id = files[0]['id']
         request = service.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-
-        fh.seek(0)
-        content = fh.read().decode('utf-8')
-        print(f"✅ Память успешно загружена с Google Диска ({len(content)} байт)")
-        return json.loads(content)
+        file_content = request.execute()
+        history = json.loads(file_content.decode('utf-8'))
+        print(f"✅ Память успешно загружена с Google Диска ({len(history)} сообщений)")
+        return history
     except Exception as e:
-        print(f"❌ Ошибка загрузки памяти с Google Диска: {e}")
+        print(f"❌ Ошибка чтения памяти с Google Диска: {e}")
         return []
 
 def save_memory_to_drive(history):
@@ -104,149 +108,159 @@ def save_memory_to_drive(history):
             return
 
         query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
-        results = service.files().list(q=query, fields="files(id)").execute()
+        results = service.files().list(
+            q=query, 
+            fields="files(id)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
         files = results.get('files', [])
 
-        # Сохраняем ВСЮ историю полностью
         data_str = json.dumps(history, ensure_ascii=False, indent=2)
         media = MediaInMemoryUpload(data_str.encode('utf-8'), mimetype='application/json')
 
         if files:
             file_id = files[0]['id']
-            service.files().update(fileId=file_id, media_body=media).execute()
+            service.files().update(
+                fileId=file_id, 
+                media_body=media,
+                supportsAllDrives=True
+            ).execute()
             print(f"✅ Память обновлена в существующем файле на Google Диске! (ID: {file_id})")
         else:
-            file_metadata = {'name': FILE_NAME, 'parents': [DRIVE_FOLDER_ID]}
-            new_file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            file_metadata = {
+                'name': FILE_NAME, 
+                'parents': [DRIVE_FOLDER_ID]
+            }
+            new_file = service.files().create(
+                body=file_metadata, 
+                media_body=media, 
+                fields='id',
+                supportsAllDrives=True
+            ).execute()
             print(f"🎉 Новый файл {FILE_NAME} СОЗДАН на Google Диске! (ID: {new_file.get('id')})")
     except Exception as e:
         print(f"❌ Ошибка сохранения памяти на Google Диск: {e}")
 
-def test_drive_connection():
-    """Тестирование работы с Google Диском при запуске бота"""
-    print("⏳ Тестирование подключения к Google Диску...")
-    initial_memory = load_memory_from_drive()
-    if not initial_memory:
-        test_history = [{"system": "Инициализация памяти бота-тренера прошла успешно"}]
-        save_memory_to_drive(test_history)
+# Global memory variable
+user_memory = load_memory_from_drive()
 
-# --- ИИ-ТРЕНЕР И POLAR FLOW ---
-SYSTEM_INSTRUCTION = """
-Ты — личный элитный тренер по лыжному ориентированию. Твой спортсмен — КМС (2011 г.р.), кандидат в юниорскую сборную России.
-Учитывай специфику вида спорта:
-- Высокая физическая нагрузка (работа одновременным бесшажным и попеременным ходами на сетке лыжней различной ширины).
-- Динамика пульсовых зон, контроль закисления, восстановление плечевого пояса и ног.
-- Ментальная свежесть для чтения карты и принятия решений по выбору варианта на высокой ЧСС (180+).
-- Твой тон: профессиональный, требовательный, мотивирующий, но с фокусом на здоровье и долгосрочный прогресс атлета.
-"""
+# ================================
+# POLAR ACCESSLINK INTEGRATION
+# ================================
+def fetch_polar_exercises():
+    """Получает последние данные о тренировках через Polar AccessLink API."""
+    if not POLAR_ACCESS_TOKEN:
+        print("⚠️ POLAR_ACCESS_TOKEN не настроен.")
+        return None
 
-def get_polar_data():
-    if POLAR_ACCESS_TOKEN:
-        try:
-            headers = {"Authorization": f"Bearer {POLAR_ACCESS_TOKEN}", "Accept": "application/json"}
-            
-            # 1. Данные о тренировках
-            exercises = requests.get("https://www.polaraccesslink.com/v3/exercises", headers=headers)
-            
-            # 2. Фазы и продолжительность сна
-            sleep = requests.get("https://www.polaraccesslink.com/v3/users/nights", headers=headers)
-            
-            # 3. Восстановление (Nightly Recharge / HRV)
-            recharge = requests.get("https://www.polaraccesslink.com/v3/users/nightly-recharge", headers=headers)
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"
+    }
+    url = "https://www.polaraccesslink.com/v3/exercises"
 
-            return {
-                "exercises": exercises.json() if exercises.status_code == 200 else [],
-                "sleep": sleep.json() if sleep.status_code == 200 else {},
-                "recharge": recharge.json() if recharge.status_code == 200 else {}
-            }
-        except Exception as e:
-            print(f"Ошибка получения данных Polar: {e}")
-    return None
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"⚠️ Polar API ответил с кодом {response.status_code}: {response.text}")
+            return None
+    except Exception as e:
+        print(f"❌ Ошибка при запросе к Polar AccessLink API: {e}")
+        return None
+
+# ================================
+# TELEGRAM & GEMINI BOT LOGIC
+# ================================
+system_instruction = (
+    "Ты — персональный AI-тренер по лыжному ориентированию, лыжным гонкам и трейлраннингу. "
+    "Ты общаешься со спортсменом высокого уровня (КМС/Сборная). Будь профессиональным, "
+    "поддерживающим, анализируй нагрузки, пульсовые зоны, подготовку инвентаря (парафины, Fischer Speedmax, Bliz) "
+    "и соревновательную тактику."
+)
+
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привет! Я твой AI-тренер по лыжным гонкам и ориентированию. Напиши мне или используй команду /sync для получения данных из Polar.")
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /sync для загрузки тренировок Polar."""
+    await update.message.reply_text("⏳ Запрашиваю последние тренировки из Polar Flow...")
+    exercises = fetch_polar_exercises()
+    
+    if not exercises:
+        await update.message.reply_text("❌ Не удалось получить новые тренировки из Polar (проверьте POLAR_ACCESS_TOKEN или новые тренировки отсутствуют).")
+        return
+
+    summary = f"Данные с Polar Flow: получено тренировок: {len(exercises)}.\n" + json.dumps(exercises, ensure_ascii=False, indent=2)
+    
+    user_memory.append({"role": "user", "parts": [f"[Системное сообщение] Проанализируй свежие данные тренировки: {summary}"]})
+    save_memory_to_drive(user_memory)
+
+    recent_history = user_memory[-30:]
+
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=recent_history,
+            config={"system_instruction": system_instruction}
+        )
+        bot_reply = response.text
+        user_memory.append({"role": "model", "parts": [bot_reply]})
+        save_memory_to_drive(user_memory)
+
+        await update.message.reply_text(bot_reply)
+    except Exception as e:
+        print(f"❌ Ошибка вызова Gemini API при синхронизации Polar: {e}")
+        await update.message.reply_text("Произошла ошибка при анализе тренировки.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
-        return
-
+    global user_memory
     user_text = update.message.text
-    
-    # 1. Загрузка ВСЕЙ истории с Google Диска
-    history = load_memory_from_drive()
 
-    # 2. Запрос данных Polar Flow при наличии ключевых слов
-    polar_context = ""
-    if any(w in user_text.lower() for w in ["тренировк", "polar", "пульс", "состояни", "анализ", "разбор", "самочувстви"]):
-        data = get_polar_data()
-        if data:
-            polar_context = f"\n[Свежие данные Polar Flow: {json.dumps(data, ensure_ascii=False)}]\n"
+    if not ai_client:
+        await update.message.reply_text("Ошибка: GEMINI_API_KEY не задан.")
+        return
 
-    # 3. Превращение ВСЕЙ истории переписки в читаемый диалоговый текст
-    formatted_history = ""
-    for turn in history:
-        if isinstance(turn, dict) and "user" in turn and "coach" in turn:
-            formatted_history += f"Спортсмен: {turn.get('user', '')}\nТренер: {turn.get('coach', '')}\n\n"
+    user_memory.append({"role": "user", "parts": [user_text]})
+    recent_history = user_memory[-30:]
 
-    full_prompt = f"Предыдущий диалог:\n{formatted_history}\n{polar_context}\nСпортсмен: {user_text}"
-
-    # 4. Отправка запроса в Gemini с обработкой ошибок
     try:
-        ai_client = genai.Client(api_key=GEMINI_API_KEY)
         response = ai_client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=full_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.7
-            )
+            model="gemini-2.5-flash",
+            contents=recent_history,
+            config={"system_instruction": system_instruction}
         )
-        answer = response.text
+        bot_reply = response.text
+
+        user_memory.append({"role": "model", "parts": [bot_reply]})
+        save_memory_to_drive(user_memory)
+
+        await update.message.reply_text(bot_reply)
+
     except Exception as e:
-        err_msg = str(e)
-        print(f"❌ Ошибка Gemini API: {err_msg}")
-        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            await update.message.reply_text("⚠️ Достигнут суточный лимит запросов к Gemini 3.6 Flash (20 в день). Подожди сброса квоты или укажи стандартную Flash-модель в коде.")
-        else:
-            await update.message.reply_text("⚠️ Ошибка при генерации ответа тренера. Подробности в логах сервера.")
-        return
+        print(f"❌ Ошибка вызова Gemini API: {e}")
+        await update.message.reply_text("Произошла ошибка при обработке запроса к AI. Попробуй позже.")
 
-    # 5. Добавление нового ответа и сохранение истории на Google Диск
-    history.append({"user": user_text, "coach": answer})
-    save_memory_to_drive(history)
-
-    await update.message.reply_text(answer)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я твой ИИ-тренер по лыжному ориентированию (работает 24/7 в облаке). Задавай вопросы или запрашивай разбор Polar!")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Глобальный обработчик ошибок Telegram-бота"""
-    err = context.error
-    if isinstance(err, (NetworkError, TimedOut)):
-        print("⚠️ Временный сетевой сбой Telegram API (Bad Gateway / Timeout). Повторное подключение...")
-        return
-    
-    print(f"❌ Ошибка в обработчике Telegram: {err}")
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text("⚠️ Произошла ошибка при обработке запроса. Подробности в логах сервера.")
-        except Exception:
-            pass
-
+# ================================
+# MAIN ENTRY POINT
+# ================================
 if __name__ == "__main__":
-    # 1. Запуск веб-сервера проверки состояния для Render
-    threading.Thread(target=run_health_check_server, daemon=True).start()
-    print("🚀 Фоновый веб-сервер проверки состояния запущен.")
+    Thread(target=run_health_check_server, daemon=True).start()
 
-    # 2. Автоматическая проверка создания файла на Google Диске прямо при старте
-    test_drive_connection()
+    print("⏳ Тестирование подключения к Google Диску...")
+    save_memory_to_drive(user_memory)
 
-    # 3. Запуск Telegram-бота
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Регистрация обработчика ошибок
-    app.add_error_handler(error_handler)
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    print("🚀 Бот-тренер успешно запущен в режиме 24/7!")
-    app.run_polling(drop_pending_updates=True)
+    if not TELEGRAM_BOT_TOKEN:
+        print("❌ Ошибка: TELEGRAM_BOT_TOKEN не задан!")
+    else:
+        app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("sync", sync_command))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        print("🚀 Бот-тренер успешно запущен в режиме 24/7!")
+        app.run_polling()
