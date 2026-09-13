@@ -13,6 +13,7 @@ from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 from google import genai
+from google.genai import types
 
 # ================================
 # LOGGING SETUP
@@ -198,7 +199,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     summary = f"Данные с Polar Flow: получено тренировок: {len(exercises)}.\n" + json.dumps(exercises, ensure_ascii=False, indent=2)
     
-    user_memory.append({"role": "user", "parts": [f"[Системное сообщение] Проанализируй свежие данные тренировки: {summary}"]})
+    user_memory.append({"role": "user", "parts": [{"text": f"[Системное сообщение] Проанализируй свежие данные тренировки: {summary}"}]})
     save_memory_to_drive(user_memory)
 
     recent_history = user_memory[-30:]
@@ -207,10 +208,11 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = ai_client.models.generate_content(
             model="gemini-3.6-flash",
             contents=recent_history,
-            config={"system_instruction": system_instruction}
+            config=types.GenerateContentConfig(system_instruction=system_instruction)
         )
         bot_reply = response.text
-        user_memory.append({"role": "model", "parts": [bot_reply]})
+        
+        user_memory.append({"role": "model", "parts": [{"text": bot_reply}]})
         save_memory_to_drive(user_memory)
 
         await update.message.reply_text(bot_reply)
@@ -226,18 +228,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ошибка: GEMINI_API_KEY не задан.")
         return
 
-    user_memory.append({"role": "user", "parts": [user_text]})
+    user_memory.append({"role": "user", "parts": [{"text": user_text}]})
     recent_history = user_memory[-30:]
 
     try:
         response = ai_client.models.generate_content(
             model="gemini-3.6-flash",
             contents=recent_history,
-            config={"system_instruction": system_instruction}
+            config=types.GenerateContentConfig(system_instruction=system_instruction)
         )
         bot_reply = response.text
 
-        user_memory.append({"role": "model", "parts": [bot_reply]})
+        user_memory.append({"role": "model", "parts": [{"text": bot_reply}]})
         save_memory_to_drive(user_memory)
 
         await update.message.reply_text(bot_reply)
@@ -265,3 +267,4 @@ if __name__ == "__main__":
         
         print("🚀 Бот-тренер успешно запущен в режиме 24/7!")
         app.run_polling()
+        
