@@ -72,6 +72,7 @@ def load_memory_from_drive():
     try:
         service = get_drive_service()
         if not service or not DRIVE_FOLDER_ID:
+            print("⚠️ DRIVE_FOLDER_ID не задан. Бот работает без постоянной памяти.")
             return []
 
         query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
@@ -104,7 +105,7 @@ def save_memory_to_drive(history):
             print("❌ Ошибка записи: не удалось подключить get_drive_service()")
             return
         if not DRIVE_FOLDER_ID:
-            print("❌ Ошибка записи: переменная DRIVE_FOLDER_ID не задана!")
+            print("❌ Ошибка записи: переменная DRIVE_FOLDER_ID не задана в Render!")
             return
 
         query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
@@ -230,7 +231,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=recent_history,
             config={"system_instruction": system_instruction}
         )
