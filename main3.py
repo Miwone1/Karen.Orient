@@ -76,6 +76,7 @@ def load_memory_from_drive():
             print("⚠️ DRIVE_FOLDER_ID не задан. Бот работает без постоянной памяти.")
             return []
 
+        # Ищем файл в указанной папке
         query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
         results = service.files().list(
             q=query, 
@@ -86,30 +87,32 @@ def load_memory_from_drive():
         files = results.get('files', [])
 
         if not files:
-            print(f"ℹ️ Файл {FILE_NAME} пока не найден на Диске. Будет создан новый при первом сообщении.")
+            print(f"ℹ️ Файл {FILE_NAME} пока не найден в папке. Проверь имя файла и доступ.")
             return []
 
         file_id = files[0]['id']
         request = service.files().get_media(fileId=file_id)
         file_content = request.execute()
-        history = json.loads(file_content.decode('utf-8'))
-        print(f"✅ Память успешно загружена с Google Диска ({len(history)} сообщений)")
-        return history
+        
+        content_str = file_content.decode('utf-8').strip()
+        if not content_str or content_str in ["{}", "[]"]:
+            return []
+
+        history = json.loads(content_str)
+        print(f"✅ Память загружена с Google Диска (сообщений: {len(history)})")
+        return history if isinstance(history, list) else []
     except Exception as e:
         print(f"❌ Ошибка чтения памяти с Google Диска: {e}")
         return []
 
 def save_memory_to_drive(history):
-    """Сохраняет массив сообщений обратно на Google Диск."""
+    """Сохраняет массив сообщений поверх существующего файла."""
     try:
         service = get_drive_service()
-        if not service:
-            print("❌ Ошибка записи: сервис Google Drive не инициализирован.")
-            return
-        if not DRIVE_FOLDER_ID:
-            print("❌ Ошибка записи: переменная DRIVE_FOLDER_ID не задана!")
+        if not service or not DRIVE_FOLDER_ID:
             return
 
+        # Ищем файл, созданный пользователем
         query = f"'{DRIVE_FOLDER_ID}' in parents and name='{FILE_NAME}' and trashed=false"
         results = service.files().list(
             q=query, 
@@ -120,28 +123,19 @@ def save_memory_to_drive(history):
         files = results.get('files', [])
 
         data_bytes = json.dumps(history, ensure_ascii=False, indent=2).encode('utf-8')
-        media = MediaInMemoryUpload(data_bytes, mimetype='application/json', resumable=True)
+        media = MediaInMemoryUpload(data_bytes, mimetype='application/json', resumable=False)
 
         if files:
             file_id = files[0]['id']
+            # Обновляем содержимое файла
             service.files().update(
                 fileId=file_id, 
                 media_body=media,
                 supportsAllDrives=True
             ).execute()
-            print(f"✅ [Google Drive] Память успешно обновлена (ID файла: {file_id})")
+            print(f"✅ [Google Drive] Память записана в файл ID: {file_id}")
         else:
-            file_metadata = {
-                'name': FILE_NAME, 
-                'parents': [DRIVE_FOLDER_ID]
-            }
-            new_file = service.files().create(
-                body=file_metadata, 
-                media_body=media, 
-                fields='id',
-                supportsAllDrives=True
-            ).execute()
-            print(f"🎉 [Google Drive] Создан новый файл памяти! (ID: {new_file.get('id')})")
+            print(f"⚠️ Файл {FILE_NAME} не найден в папке {DRIVE_FOLDER_ID}. Некуда записывать.")
     except Exception as e:
         print(f"❌ Ошибка сохранения памяти на Google Диск: {e}")
 
