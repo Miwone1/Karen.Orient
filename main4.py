@@ -140,8 +140,8 @@ user_memory = load_memory_from_drive()
 # ================================
 # POLAR ACCESSLINK INTEGRATION
 # ================================
-def fetch_polar_exercises():
-    """Запрашивает последние упражнения из Polar AccessLink API."""
+def fetch_polar_data(endpoint):
+    """Универсальная функция для запросов к Polar AccessLink API."""
     if not POLAR_ACCESS_TOKEN:
         print("⚠️ POLAR_ACCESS_TOKEN не настроен.")
         return None
@@ -150,18 +150,34 @@ def fetch_polar_exercises():
         "Accept": "application/json",
         "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"
     }
-    url = "https://www.polaraccesslink.com/v3/exercises"
+    url = f"https://www.polaraccesslink.com/v3/{endpoint}"
 
     try:
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
             return response.json()
         else:
-            print(f"⚠️ Polar API ответил с кодом {response.status_code}: {response.text}")
+            print(f"⚠️ Polar API ({endpoint}) ответил с кодом {response.status_code}: {response.text}")
             return None
     except Exception as e:
-        print(f"❌ Ошибка при запросе к Polar AccessLink API: {e}")
+        print(f"❌ Ошибка при запросе к Polar AccessLink API ({endpoint}): {e}")
         return None
+
+def fetch_polar_exercises():
+    """Запрашивает последние упражнения."""
+    return fetch_polar_data("exercises")
+
+def fetch_polar_sleep():
+    """Запрашивает данные о сне."""
+    return fetch_polar_data("users/sleep")
+
+def fetch_polar_activity():
+    """Запрашивает данные о дневной активности."""
+    return fetch_polar_data("users/activity-transactions")
+
+def fetch_polar_recharge():
+    """Запрашивает данные о восстановлении (Nightly Recharge / ANS Charge)."""
+    return fetch_polar_data("users/nightly-recharge")
 
 # ================================
 # TELEGRAM & GEMINI BOT LOGIC
@@ -170,41 +186,60 @@ system_instruction = (
     "Ты — персональный AI-тренер по лыжному ориентированию, лыжным гонкам и трейлраннингу. "
     "Ты общаешься со спортсменом высокого уровня (КМС/Сборная). Будь профессиональным, "
     "поддерживающим, анализируй нагрузки, пульсовые зоны, подготовку инвентаря (парафины, Fischer Speedmax, Bliz) "
-    "и соревновательную тактику. У тебя есть доступ к истории тренировок и диалогов."
+    "и соревновательную тактику. У тебя есть доступ к истории тренировок, сна, активности, восстановления и диалогов."
 )
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я твой AI-тренер по лыжным гонкам и ориентированию. Отправляй сообщения или используй /sync для загрузки тренировок Polar.")
+    await update.message.reply_text("Привет! Я твой AI-тренер по лыжным гонкам и ориентированию. Отправляй сообщения или используй /sync для загрузки данных Polar.")
 
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Синхронизация тренировок: сохраняет данные в память и отправляет короткий отчет."""
-    await update.message.reply_text("⏳ Запрашиваю данные из Polar Flow...")
-    exercises = fetch_polar_exercises()
+    """Синхронизация тренировок, сна, активности и восстановления из Polar Flow."""
+    await update.message.reply_text("⏳ Запрашиваю данные о тренировках, сне, активности и восстановлении из Polar Flow...")
     
-    if not exercises:
-        await update.message.reply_text("❌ Новые тренировки в Polar не найдены или возникла ошибка доступа.")
+    exercises = fetch_polar_exercises()
+    sleep_data = fetch_polar_sleep()
+    activity_data = fetch_polar_activity()
+    recharge_data = fetch_polar_recharge()
+
+    if not any([exercises, sleep_data, activity_data, recharge_data]):
+        await update.message.reply_text("❌ Новые данные в Polar не найдены или возникла ошибка доступа.")
         return
 
-    # Сохраняем поступившие данные в глобальную память
-    summary_data = json.dumps(exercises, ensure_ascii=False, indent=2)
+    # Формируем объединенный отчет о показателях
+    combined_polar_data = {
+        "exercises": exercises,
+        "sleep": sleep_data,
+        "activity": activity_data,
+        "nightly_recharge": recharge_data
+    }
+
+    summary_data = json.dumps(combined_polar_data, ensure_ascii=False, indent=2)
     user_memory.append({
         "role": "user", 
-        "parts": [{"text": f"[Системные данные Polar] Загружена тренировка:\n{summary_data}"}]
+        "parts": [{"text": f"[Системные данные Polar] Загружен комплексный отчет (тренировки, сон, активность, восстановление):\n{summary_data}"}]
     })
     
+    # Также сохраняем фиктивный ответ модели, чтобы диалоговая цепочка Gemini была валидной
     user_memory.append({
         "role": "model", 
-        "parts": [{"text": "Данные тренировки успешно сохранены в память."}]
+        "parts": [{"text": "Данные тренировок, сна, активности и восстановления успешно сохранены в память."}]
     })
 
+    # Записываем обновленную память на Google Диск
     save_memory_to_drive(user_memory)
 
-    count = len(exercises) if isinstance(exercises, list) else 1
+    report_details = []
+    if exercises: report_details.append("тренировки")
+    if sleep_data: report_details.append("сон")
+    if activity_data: report_details.append("активность")
+    if recharge_data: report_details.append("восстановление")
+
+    synced_types = ", ".join(report_details)
     await update.message.reply_text(
-        f"✅ Тренировка успешно синхронизирована! Получено записей: {count}.\n\n"
-        f"Данные сохранены в общую память. Задай мне любой вопрос по этой тренировке или попроси сделать разбор."
+        f"✅ Синхронизация завершена!\nУспешно получены данные: {synced_types}.\n\n"
+        f"Данные сохранены в общую память. Задай мне любой вопрос или попроси сделать разбор состояния и тренировок."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -218,41 +253,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1. Записываем вопрос пользователя
     user_memory.append({"role": "user", "parts": [{"text": user_text}]})
     
-    # Для контекста AI берем последние 40 записей
+    # Для контекста AI берем последние 40 записей из всей накопившейся истории
     recent_history = user_memory[-40:]
 
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = ai_client.models.generate_content(
-                model="gemini-3.5-flash-lite",
-                contents=recent_history,
-                config=types.GenerateContentConfig(system_instruction=system_instruction)
-            )
-            bot_reply = response.text
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=recent_history,
+            config=types.GenerateContentConfig(system_instruction=system_instruction)
+        )
+        bot_reply = response.text
 
-            # 2. Записываем ответ AI
-            user_memory.append({"role": "model", "parts": [{"text": bot_reply}]})
-            
-            # 3. Синхронизируем весь массив на Google Диск
-            save_memory_to_drive(user_memory)
+        # 2. Записываем ответ AI
+        user_memory.append({"role": "model", "parts": [{"text": bot_reply}]})
+        
+        # 3. Синхронизируем весь массив на Google Диск
+        save_memory_to_drive(user_memory)
 
-            await update.message.reply_text(bot_reply)
-            break
+        await update.message.reply_text(bot_reply)
 
-        except Exception as e:
-            error_str = str(e)
-            print(f"❌ Ошибка вызова Gemini API (попытка {attempt + 1}): {error_str}")
-            
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** (attempt + 1))
-                    continue
-                else:
-                    await update.message.reply_text("⏳ Превышен лимит запросов к AI. Подожди 1 минуту и спроси снова!")
-            else:
-                await update.message.reply_text("Произошла ошибка при обработке запроса.")
-                break
+    except Exception as e:
+        print(f"❌ Ошибка вызова Gemini API: {e}")
+        await update.message.reply_text("Произошла ошибка при обработке запроса.")
 
 # ================================
 # MAIN ENTRY POINT
