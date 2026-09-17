@@ -252,7 +252,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_memory.append({"role": "user", "parts": [{"text": user_text}]})
 
     # Берем последние 30 записей для API, чтобы не превышать квоту 250к токенов в минуту
-    recent_context = user_memory[-50:]
+    recent_context = user_memory[-30:]
 
     # Автоматические повторные попытки (retry) при лимитах
     max_retries = 3
