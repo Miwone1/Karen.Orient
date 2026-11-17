@@ -5,6 +5,7 @@ import asyncio
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
+from datetime import datetime
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -31,7 +32,8 @@ DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 POLAR_ACCESS_TOKEN = os.environ.get("POLAR_ACCESS_TOKEN")
 
-FILE_NAME = "ski_coach_memory.json"
+TRAINING_FILE_NAME = "ski_coach_data.json"
+CHAT_FILE_NAME = "ski_coach_chat.json"
 SCOPES = ['https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive']
 
 # ================================
@@ -65,253 +67,247 @@ def get_drive_service():
         return None
     try:
         creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        creds = service_account.Credentials.from_service_account_info(
-            creds_dict, scopes=SCOPES
-        )
+        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         return build('drive', 'v3', credentials=creds)
     except Exception as e:
         print(f"❌ Ошибка авторизации Google Drive API: {e}")
         return None
 
-def find_memory_file(service):
-    """Поиск файла по имени на Google Диске."""
+def find_file(service, filename):
     try:
-        query = f"name='{FILE_NAME}' and trashed=false"
-        results = service.files().list(
-            q=query, 
-            fields="files(id, name, mimeType)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
+        query = f"name='{filename}' and trashed=false"
+        results = service.files().list(q=query, fields="files(id, name)", supportsAllDrives=True).execute()
         files = results.get('files', [])
         return files[0]['id'] if files else None
     except Exception as e:
-        print(f"❌ Ошибка при поиске файла на Диске: {e}")
+        print(f"❌ Ошибка поиска файла {filename}: {e}")
         return None
 
-def load_memory_from_drive():
+def load_json_from_drive(filename):
     try:
         service = get_drive_service()
-        if not service:
-            return []
-
-        file_id = find_memory_file(service)
-        if not file_id:
-            print(f"ℹ️ Файл {FILE_NAME} не найден на Диске.")
-            return []
-
+        if not service: return {}
+        file_id = find_file(service, filename)
+        if not file_id: return {}
+        
         request = service.files().get_media(fileId=file_id)
-        file_content = request.execute()
-        
-        content_str = file_content.decode('utf-8').strip()
-        if not content_str or content_str in ["{}", "[]"]:
-            return []
-
-        history = json.loads(content_str)
-        if not isinstance(history, list):
-            return []
-
-        # --- МИГРАЦИЯ СТАРОГО ФОРМАТА GEMINI -> OPENAI/DEEPSEEK ---
-        migrated_history = []
-        for msg in history:
-            # Если это старый формат с 'parts'
-            if "parts" in msg:
-                text_content = msg["parts"][0].get("text", "") if msg["parts"] else ""
-                role = "assistant" if msg["role"] == "model" else "user"
-                migrated_history.append({"role": role, "content": text_content})
-            # Если это уже новый формат с 'content'
-            elif "content" in msg:
-                migrated_history.append(msg)
-        
-        print(f"✅ Память загружена с Google Диска (сообщений: {len(migrated_history)})")
-        return migrated_history
+        content = request.execute().decode('utf-8').strip()
+        return json.loads(content) if content else {}
     except Exception as e:
-        print(f"❌ Ошибка чтения памяти с Google Диска: {e}")
-        return []
+        print(f"❌ Ошибка чтения {filename}: {e}")
+        return {}
 
-def save_memory_to_drive(history):
-    """Сохраняет всю накопившуюся историю поверх файла на Google Диске."""
+def save_json_to_drive(filename, data):
     try:
         service = get_drive_service()
-        if not service:
-            return
-
-        file_id = find_memory_file(service)
-
-        data_bytes = json.dumps(history, ensure_ascii=False, indent=2).encode('utf-8')
+        if not service: return
+        file_id = find_file(service, filename)
+        data_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8')
         media = MediaInMemoryUpload(data_bytes, mimetype='application/json', resumable=False)
-
+        
         if file_id:
-            service.files().update(
-                fileId=file_id, 
-                media_body=media,
-                supportsAllDrives=True
-            ).execute()
-            print(f"✅ [Google Drive] Память успешно сохранена (записей: {len(history)})")
+            service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+            print(f"✅ [Google Drive] {filename} обновлен.")
         else:
-            print(f"⚠️ Файл {FILE_NAME} не найден на Диске.")
+            file_metadata = {'name': filename}
+            if DRIVE_FOLDER_ID: file_metadata['parents'] = [DRIVE_FOLDER_ID]
+            service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            print(f"✅ [Google Drive] {filename} создан.")
     except Exception as e:
-        print(f"❌ Ошибка сохранения памяти на Google Диск: {e}")
+        print(f"❌ Ошибка сохранения {filename}: {e}")
 
-# Global memory variable
-user_memory = load_memory_from_drive()
+# Глобальные переменные для данных
+training_database = {} # Словарь: {"2023-10-25": {"exercises": [...], "sleep": {...}}}
+chat_history = []      # История диалога (последние 15 сообщений)
 
 # ================================
 # POLAR ACCESSLINK INTEGRATION
 # ================================
 def fetch_polar_data(endpoint):
-    """Универсальная функция для запросов к Polar AccessLink API."""
-    if not POLAR_ACCESS_TOKEN:
-        print("⚠️ POLAR_ACCESS_TOKEN не настроен.")
-        return None
-
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"
-    }
-    url = f"https://www.polaraccesslink.com/v3/{endpoint}"
-
+    if not POLAR_ACCESS_TOKEN: return None
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"}
     try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"⚠️ Polar API ({endpoint}) ответил с кодом {response.status_code}: {response.text}")
-            return None
+        response = requests.get(f"https://www.polaraccesslink.com/v3/{endpoint}", headers=headers)
+        return response.json() if response.status_code == 200 else None
     except Exception as e:
-        print(f"❌ Ошибка при запросе к Polar AccessLink API ({endpoint}): {e}")
+        print(f"❌ Ошибка Polar API: {e}")
         return None
-
-def fetch_polar_exercises():
-    return fetch_polar_data("exercises")
-
-def fetch_polar_sleep():
-    return fetch_polar_data("users/sleep")
-
-def fetch_polar_activity():
-    return fetch_polar_data("users/activity-transactions")
-
-def fetch_polar_recharge():
-    return fetch_polar_data("users/nightly-recharge")
 
 # ================================
-# TELEGRAM & DEEPSEEK BOT LOGIC
+# TELEGRAM & DEEPSEEK LOGIC
 # ================================
 system_instruction = (
     "Ты — персональный AI-тренер по лыжному ориентированию, лыжным гонкам и трейлраннингу. "
     "Ты общаешься со спортсменом высокого уровня (КМС/Сборная). Будь профессиональным, "
     "поддерживающим, анализируй нагрузки, пульсовые зоны, подготовку инвентаря (парафины, Fischer Speedmax, Bliz) "
-    "и соревновательную тактику. У тебя есть доступ к истории тренировок, сна, активности, восстановления и диалогов."
+    "и соревновательную тактику. Если пользователь просит отчет за какой-то период, используй функцию get_training_data_by_date."
 )
 
-# Инициализация клиента DeepSeek (использует SDK OpenAI)
-ai_client = OpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"
-) if DEEPSEEK_API_KEY else None
+ai_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com") if DEEPSEEK_API_KEY else None
+
+# Описание инструментов для DeepSeek (Function Calling)
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_training_data_by_date",
+        "description": "Получает данные о тренировках, сне и восстановлении за конкретный период дат.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start_date": {
+                    "type": "string",
+                    "description": "Начальная дата в формате YYYY-MM-DD"
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "Конечная дата в формате YYYY-MM-DD"
+                }
+            },
+            "required": ["start_date", "end_date"]
+        }
+    }
+}]
+
+def get_training_data_by_date(start_date: str, end_date: str) -> str:
+    """Функция, которую вызывает DeepSeek, чтобы достать данные из базы по датам."""
+    filtered_data = {}
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+        
+        for date_str, data in training_database.items():
+            current_dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            if start_dt <= current_dt <= end_dt:
+                filtered_data[date_str] = data
+                
+        if not filtered_data:
+            return f"За период с {start_date} по {end_date} данных в памяти не найдено."
+            
+        return json.dumps(filtered_data, ensure_ascii=False)
+    except Exception as e:
+        return f"Ошибка при поиске данных: {str(e)}"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я твой AI-тренер по лыжным гонкам и ориентированию. Отправляй сообщения или используй /sync для загрузки данных Polar.")
+    await update.message.reply_text("Привет! Я твой AI-тренер. Отправляй сообщения или используй /sync для загрузки данных Polar.")
 
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Синхронизация тренировок, сна, активности и восстановления из Polar Flow."""
-    await update.message.reply_text("⏳ Запрашиваю данные о тренировках, сне, активности и восстановлении из Polar Flow...")
+    global training_database
+    await update.message.reply_text("⏳ Запрашиваю данные из Polar Flow и раскладываю их по датам...")
     
-    exercises = fetch_polar_exercises()
-    sleep_data = fetch_polar_sleep()
-    activity_data = fetch_polar_activity()
-    recharge_data = fetch_polar_recharge()
+    exercises = fetch_polar_data("exercises")
+    sleep_data = fetch_polar_data("users/sleep")
+    recharge_data = fetch_polar_data("users/nightly-recharge")
 
-    if not any([exercises, sleep_data, activity_data, recharge_data]):
-        await update.message.reply_text("❌ Новые данные в Polar не найдены или возникла ошибка доступа.")
+    if not any([exercises, sleep_data, recharge_data]):
+        await update.message.reply_text("❌ Новые данные в Polar не найдены.")
         return
 
-    combined_polar_data = {
-        "exercises": exercises,
-        "sleep": sleep_data,
-        "activity": activity_data,
-        "nightly_recharge": recharge_data
-    }
-
-    summary_data = json.dumps(combined_polar_data, ensure_ascii=False, indent=2)
+    # Группировка данных по датам
+    grouped_data = {}
     
-    # Запись в формате OpenAI/DeepSeek
-    user_memory.append({
-        "role": "user", 
-        "content": f"[Системные данные Polar] Загружен комплексный отчет (тренировки, сон, активность, восстановление):\n{summary_data}"
-    })
-    
-    user_memory.append({
-        "role": "assistant", 
-        "content": "Данные тренировок, сна, активности и восстановления успешно сохранены в память."
-    })
+    # Обработка тренировок
+    if exercises and isinstance(exercises, dict):
+        for ex in exercises.get("exercises", []):
+            # Пытаемся достать дату из тренировки (Polar отдает в start-time)
+            date_str = ex.get("start-time", "")[:10] 
+            if date_str:
+                if date_str not in grouped_data: grouped_data[date_str] = {}
+                if "exercises" not in grouped_data[date_str]: grouped_data[date_str]["exercises"] = []
+                grouped_data[date_str]["exercises"].append(ex)
 
-    save_memory_to_drive(user_memory)
+    # Обработка сна
+    if sleep_data and isinstance(sleep_data, dict):
+        for sl in sleep_data.get("nights", []):
+            date_str = sl.get("date", "")
+            if date_str:
+                if date_str not in grouped_data: grouped_data[date_str] = {}
+                grouped_data[date_str]["sleep"] = sl
+                
+    # Обработка восстановления
+    if recharge_data and isinstance(recharge_data, dict):
+        for rec in recharge_data.get("recharges", []):
+            date_str = rec.get("date", "")
+            if date_str:
+                if date_str not in grouped_data: grouped_data[date_str] = {}
+                grouped_data[date_str]["recharge"] = rec
 
-    report_details = []
-    if exercises: report_details.append("тренировки")
-    if sleep_data: report_details.append("сон")
-    if activity_data: report_details.append("активность")
-    if recharge_data: report_details.append("восстановление")
-
-    synced_types = ", ".join(report_details)
-    await update.message.reply_text(
-        f"✅ Синхронизация завершена!\nУспешно получены данные: {synced_types}.\n\n"
-        f"Данные сохранены в общую память. Задай мне любой вопрос или попроси сделать разбор состояния и тренировок."
-    )
+    # Сохраняем в глобальную базу и на Диск
+    if grouped_data:
+        training_database.update(grouped_data)
+        save_json_to_drive(TRAINING_FILE_NAME, training_database)
+        await update.message.reply_text(f"✅ Синхронизация завершена! Добавлены данные за {len(grouped_data)} дней. База обновлена.")
+    else:
+        await update.message.reply_text("⚠️ Данные получены, но не удалось распознать даты. Формат ответа Polar мог измениться.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global user_memory
+    global chat_history
     user_text = update.message.text
 
     if not ai_client:
         await update.message.reply_text("Ошибка: DEEPSEEK_API_KEY не задан.")
         return
 
-    # 1. Записываем новый вопрос в память
-    user_memory.append({"role": "user", "content": user_text})
+    # Добавляем сообщение в историю
+    chat_history.append({"role": "user", "content": user_text})
+    recent_context = chat_history[-10:] # Храним только 10 последних реплик для диалога
 
-    # Берем последние 15 записей для контекста (чтобы не тратить лишние токены)
-    recent_context = user_memory[-15:]
+    messages = [
+        {"role": "system", "content": system_instruction},
+        *recent_context
+    ]
 
-    # Автоматические повторные попытки (retry) при лимитах
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # Вызов DeepSeek через OpenAI SDK
-            response = ai_client.chat.completions.create(
-                model="deepseek-flash",  # Актуальная модель DeepSeek
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    *recent_context
-                ],
-                stream=False
-            )
-            
-            bot_reply = response.choices[0].message.content
+    try:
+        # Первый запрос к DeepSeek: разрешаем ему использовать инструменты (Tools)
+        response = ai_client.chat.completions.create(
+            model="deepseek-flash",
+            messages=messages,
+            tools=tools,
+            tool_choice="auto" # DeepSeek сам решит, когда вызвать функцию
+        )
 
-            # 2. Записываем ответ AI
-            user_memory.append({"role": "assistant", "content": bot_reply})
-            
-            # 3. Синхронизируем весь массив на Google Диск
-            save_memory_to_drive(user_memory)
-
-            await update.message.reply_text(bot_reply)
-            break
-
-        except Exception as e:
-            error_str = str(e)
-            print(f"❌ Ошибка вызова DeepSeek API (попытка {attempt + 1}): {error_str}")
-            
-            if "429" in error_str or "rate" in error_str.lower():
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(10 * (attempt + 1))  # Пауза перед повторной попыткой
-                    continue
-                else:
-                    await update.message.reply_text("⏳ Превышен лимит запросов DeepSeek. Подожди 1 минуту и отправь сообщение еще раз!")
+        response_message = response.choices[0].message
+        
+        # Проверяем, решил ли DeepSeek вызвать функцию поиска по датам
+        if response_message.tool_calls:
+            function_name = response_message.tool_calls[0].function.name
+            if function_name == "get_training_data_by_date":
+                args = json.loads(response_message.tool_calls[0].function.arguments)
+                
+                # Вызываем нашу функцию и получаем отфильтрованные данные
+                function_response = get_training_data_by_date(args["start_date"], args["end_date"])
+                
+                # Добавляем ответ функции в контекст для DeepSeek
+                messages.append(response_message) # Сообщение с tool_calls
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": response_message.tool_calls[0].id,
+                    "name": function_name,
+                    "content": function_response
+                })
+                
+                # Второй запрос: DeepSeek анализирует полученные данные и пишет ответ
+                second_response = ai_client.chat.completions.create(
+                    model="deepseek-flash",
+                    messages=messages
+                )
+                bot_reply = second_response.choices[0].message.content
             else:
-                await update.message.reply_text("Произошла ошибка при обработке запроса.")
-                break
+                bot_reply = "Произошла ошибка при выборе инструмента."
+        else:
+            # Если инструменты не нужны, просто берем текстовый ответ
+            bot_reply = response_message.content
+
+        # Сохраняем ответ в историю
+        chat_history.append({"role": "assistant", "content": bot_reply})
+        
+        # Синхронизируем историю диалога на Диск (чтобы не потерялась при рестарте)
+        save_json_to_drive(CHAT_FILE_NAME, {"history": chat_history})
+
+        await update.message.reply_text(bot_reply)
+
+    except Exception as e:
+        print(f"❌ Ошибка DeepSeek: {e}")
+        await update.message.reply_text("Произошла ошибка при обработке запроса. Проверьте логи на Render.")
 
 # ================================
 # MAIN ENTRY POINT
@@ -319,18 +315,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     Thread(target=run_health_check_server, daemon=True).start()
 
-    print("⏳ Загрузка памяти с Google Диска...")
-    user_memory = load_memory_from_drive()
+    print("⏳ Загрузка баз данных с Google Диска...")
+    training_database = load_json_from_drive(TRAINING_FILE_NAME)
+    chat_data = load_json_from_drive(CHAT_FILE_NAME)
+    chat_history = chat_data.get("history", [])
 
-    if not TELEGRAM_BOT_TOKEN:
-        print("❌ Ошибка: TELEGRAM_BOT_TOKEN не задан!")
-    elif not DEEPSEEK_API_KEY:
-        print("❌ Ошибка: DEEPSEEK_API_KEY не задан!")
+    if not TELEGRAM_BOT_TOKEN or not DEEPSEEK_API_KEY:
+        print("❌ Ошибка: Проверьте переменные TELEGRAM_BOT_TOKEN и DEEPSEEK_API_KEY!")
     else:
         app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
         app.add_handler(CommandHandler("start", start_command))
         app.add_handler(CommandHandler("sync", sync_command))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        print("🚀 Бот-тренер успешно запущен в режиме 24/7 на DeepSeek!")
+        print("🚀 Бот-тренер успешно запущен на DeepSeek с базой данных по датам!")
         app.run_polling(drop_pending_updates=True)
