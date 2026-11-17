@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import requests
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 from datetime import datetime
@@ -121,56 +122,43 @@ training_database = {}
 chat_history = []      
 
 # ================================
-# POLAR ACCESSLINK INTEGRATION (восстановлено как в старом коде)
+# POLAR ACCESSLINK INTEGRATION
 # ================================
 def fetch_polar_data(endpoint):
-    """Универсальная функция для запросов к Polar AccessLink API."""
-    if not POLAR_ACCESS_TOKEN:
-        print("⚠️ POLAR_ACCESS_TOKEN не настроен.")
-        return None
-
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"
-    }
+    if not POLAR_ACCESS_TOKEN: return None
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"}
     url = f"https://www.polaraccesslink.com/v3/{endpoint}"
-
     try:
         response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"⚠️ Polar API ({endpoint}) ответил с кодом {response.status_code}: {response.text}")
-            return None
+        if response.status_code == 200: return response.json()
+        print(f"⚠️ Polar API ({endpoint}) ответил с кодом {response.status_code}: {response.text}")
+        return None
     except Exception as e:
-        print(f"❌ Ошибка при запросе к Polar AccessLink API ({endpoint}): {e}")
+        print(f"❌ Ошибка Polar API ({endpoint}): {e}")
         return None
 
-def fetch_polar_exercises():
-    return fetch_polar_data("exercises")
-
-def fetch_polar_sleep():
-    return fetch_polar_data("users/sleep")
-
-def fetch_polar_activity():
-    return fetch_polar_data("users/activity-transactions")
-
-def fetch_polar_recharge():
-    return fetch_polar_data("users/nightly-recharge")
+def fetch_polar_exercises(): return fetch_polar_data("exercises")
+def fetch_polar_sleep(): return fetch_polar_data("users/sleep")
+def fetch_polar_activity(): return fetch_polar_data("users/activity-transactions")
+def fetch_polar_recharge(): return fetch_polar_data("users/nightly-recharge")
 
 # ================================
 # TELEGRAM & DEEPSEEK LOGIC
 # ================================
+# Указываем текущую дату и правила, чтобы модель не выдумывала годы
+current_date = datetime.now().strftime("%Y-%m-%d")
 system_instruction = (
     "Ты — персональный AI-тренер по лыжному ориентированию, лыжным гонкам и трейлраннингу. "
     "Ты общаешься со спортсменом высокого уровня (КМС/Сборная). Будь профессиональным, "
     "поддерживающим, анализируй нагрузки, пульсовые зоны, подготовку инвентаря (парафины, Fischer Speedmax, Bliz) "
-    "и соревновательную тактику. Если пользователь просит отчет за какой-то период, используй функцию get_training_data_by_date."
+    "и соревновательную тактику. "
+    f"ВАЖНО: Сегодня {current_date}. Если пользователь просит 'последнюю тренировку' или 'отчет за период', "
+    "используй функцию get_training_data_by_date с правильными датами. Не выдумывай даты из прошлых лет."
 )
 
 ai_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com") if DEEPSEEK_API_KEY else None
 
-# Описание инструментов для DeepSeek
+# Описание инструментов
 tools = [{
     "type": "function",
     "function": {
@@ -212,7 +200,6 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global training_database
     await update.message.reply_text("⏳ Запрашиваю данные из Polar Flow (тренировки, сон, активность, восстановление)...")
     
-    # 1. Используем восстановленные функции
     exercises_raw = fetch_polar_exercises()
     sleep_raw = fetch_polar_sleep()
     activity_raw = fetch_polar_activity()
@@ -224,13 +211,11 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     grouped_data = {}
 
-    # Вспомогательная функция для безопасного извлечения списка
     def get_list(data, key):
         if isinstance(data, list): return data
         if isinstance(data, dict): return data.get(key, [])
         return []
 
-    # 2. Тренировки
     for ex in get_list(exercises_raw, "exercises"):
         if isinstance(ex, dict):
             date_str = ex.get("start-time", "")[:10] or ex.get("date", "")
@@ -239,7 +224,6 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if "exercises" not in grouped_data[date_str]: grouped_data[date_str]["exercises"] = []
                 grouped_data[date_str]["exercises"].append(ex)
 
-    # 3. Сон
     for sl in get_list(sleep_raw, "nights"):
         if isinstance(sl, dict):
             date_str = sl.get("date", "")
@@ -247,7 +231,6 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 grouped_data[date_str]["sleep"] = sl
                 
-    # 4. Активность
     for act in get_list(activity_raw, "activity-transactions"):
         if isinstance(act, dict):
             date_str = act.get("date", "")
@@ -255,7 +238,6 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 grouped_data[date_str]["activity"] = act
 
-    # 5. Восстановление
     for rec in get_list(recharge_raw, "recharges"):
         if isinstance(rec, dict):
             date_str = rec.get("date", "")
@@ -263,13 +245,25 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 grouped_data[date_str]["recharge"] = rec
 
-    # Сохраняем в базу и на Диск
     if grouped_data:
         training_database.update(grouped_data)
         save_json_to_drive(TRAINING_FILE_NAME, training_database)
         await update.message.reply_text(f"✅ Синхронизация завершена! Добавлены данные за {len(grouped_data)} дней. База обновлена.")
     else:
         await update.message.reply_text("⚠️ Данные получены, но не удалось распознать даты. Возможно, структура ответа Polar изменилась.")
+
+# Функция для ручного парсинга галлюцинаций DeepSeek (теги <|DSML|>)
+def parse_dsml_text(text):
+    if "<|DSML|" not in text:
+        return None
+    
+    # Ищем аргументы
+    start_match = re.search(r'name="start_date"[^>]*>([^<]+)', text)
+    end_match = re.search(r'name="end_date"[^>]*>([^<]+)', text)
+    
+    if start_match and end_match:
+        return start_match.group(1).strip(), end_match.group(1).strip()
+    return None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global chat_history
@@ -288,15 +282,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     try:
+        # ИСПОЛЬЗУЕМ deepseek-chat, так как он лучше работает с Function Calling
         response = ai_client.chat.completions.create(
-            model="deepseek-flash",
+            model="deepseek-chat", 
             messages=messages,
             tools=tools,
             tool_choice="auto"
         )
 
         response_message = response.choices[0].message
+        bot_reply = response_message.content or ""
         
+        # 1. Штатная обработка вызова функции
         if response_message.tool_calls:
             function_name = response_message.tool_calls[0].function.name
             if function_name == "get_training_data_by_date":
@@ -312,14 +309,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 })
                 
                 second_response = ai_client.chat.completions.create(
-                    model="deepseek-flash",
+                    model="deepseek-chat",
+                    messages=messages
+                )
+                bot_reply = second_response.choices[0].message.content
+        
+        # 2. Защита от галлюцинаций (если модель вернула теги в виде текста)
+        elif "<|DSML|" in bot_reply:
+            print("⚠️ Обнаружены DSML-теги в тексте. Пытаемся распарсить...")
+            parsed_dates = parse_dsml_text(bot_reply)
+            if parsed_dates:
+                start_date, end_date = parsed_dates
+                function_response = get_training_data_by_date(start_date, end_date)
+                
+                # Отправляем данные обратно модели
+                messages.append({"role": "assistant", "content": bot_reply})
+                messages.append({"role": "user", "content": f"Вот данные, которые ты запросил:\n{function_response}\n\nПожалуйста, проанализируй их и ответь пользователю."})
+                
+                second_response = ai_client.chat.completions.create(
+                    model="deepseek-chat",
                     messages=messages
                 )
                 bot_reply = second_response.choices[0].message.content
             else:
-                bot_reply = "Произошла ошибка при выборе инструмента."
-        else:
-            bot_reply = response_message.content
+                bot_reply = "Не удалось распознать даты в запросе. Попробуй сформулировать иначе (например: 'Отчет с 2026-11-01 по 2026-11-15')."
 
         chat_history.append({"role": "assistant", "content": bot_reply})
         save_json_to_drive(CHAT_FILE_NAME, {"history": chat_history})
