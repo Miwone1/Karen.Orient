@@ -4,3 +4,4 @@ python-telegram-bot
 nest_asyncio
 google-api-python-client
 google-auth
+openai
