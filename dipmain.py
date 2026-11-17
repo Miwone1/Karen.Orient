@@ -116,22 +116,47 @@ def save_json_to_drive(filename, data):
     except Exception as e:
         print(f"❌ Ошибка сохранения {filename}: {e}")
 
-# Глобальные переменные для данных
-training_database = {} # Словарь: {"2023-10-25": {"exercises": [...], "sleep": {...}}}
-chat_history = []      # История диалога (последние 15 сообщений)
+# Глобальные переменные
+training_database = {} 
+chat_history = []      
 
 # ================================
-# POLAR ACCESSLINK INTEGRATION
+# POLAR ACCESSLINK INTEGRATION (восстановлено как в старом коде)
 # ================================
 def fetch_polar_data(endpoint):
-    if not POLAR_ACCESS_TOKEN: return None
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"}
-    try:
-        response = requests.get(f"https://www.polaraccesslink.com/v3/{endpoint}", headers=headers)
-        return response.json() if response.status_code == 200 else None
-    except Exception as e:
-        print(f"❌ Ошибка Polar API: {e}")
+    """Универсальная функция для запросов к Polar AccessLink API."""
+    if not POLAR_ACCESS_TOKEN:
+        print("⚠️ POLAR_ACCESS_TOKEN не настроен.")
         return None
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"
+    }
+    url = f"https://www.polaraccesslink.com/v3/{endpoint}"
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"⚠️ Polar API ({endpoint}) ответил с кодом {response.status_code}: {response.text}")
+            return None
+    except Exception as e:
+        print(f"❌ Ошибка при запросе к Polar AccessLink API ({endpoint}): {e}")
+        return None
+
+def fetch_polar_exercises():
+    return fetch_polar_data("exercises")
+
+def fetch_polar_sleep():
+    return fetch_polar_data("users/sleep")
+
+def fetch_polar_activity():
+    return fetch_polar_data("users/activity-transactions")
+
+def fetch_polar_recharge():
+    return fetch_polar_data("users/nightly-recharge")
 
 # ================================
 # TELEGRAM & DEEPSEEK LOGIC
@@ -145,7 +170,7 @@ system_instruction = (
 
 ai_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com") if DEEPSEEK_API_KEY else None
 
-# Описание инструментов для DeepSeek (Function Calling)
+# Описание инструментов для DeepSeek
 tools = [{
     "type": "function",
     "function": {
@@ -154,14 +179,8 @@ tools = [{
         "parameters": {
             "type": "object",
             "properties": {
-                "start_date": {
-                    "type": "string",
-                    "description": "Начальная дата в формате YYYY-MM-DD"
-                },
-                "end_date": {
-                    "type": "string",
-                    "description": "Конечная дата в формате YYYY-MM-DD"
-                }
+                "start_date": {"type": "string", "description": "Начальная дата YYYY-MM-DD"},
+                "end_date": {"type": "string", "description": "Конечная дата YYYY-MM-DD"}
             },
             "required": ["start_date", "end_date"]
         }
@@ -169,7 +188,6 @@ tools = [{
 }]
 
 def get_training_data_by_date(start_date: str, end_date: str) -> str:
-    """Функция, которую вызывает DeepSeek, чтобы достать данные из базы по датам."""
     filtered_data = {}
     try:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
@@ -192,52 +210,66 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global training_database
-    await update.message.reply_text("⏳ Запрашиваю данные из Polar Flow и раскладываю их по датам...")
+    await update.message.reply_text("⏳ Запрашиваю данные из Polar Flow (тренировки, сон, активность, восстановление)...")
     
-    exercises = fetch_polar_data("exercises")
-    sleep_data = fetch_polar_data("users/sleep")
-    recharge_data = fetch_polar_data("users/nightly-recharge")
+    # 1. Используем восстановленные функции
+    exercises_raw = fetch_polar_exercises()
+    sleep_raw = fetch_polar_sleep()
+    activity_raw = fetch_polar_activity()
+    recharge_raw = fetch_polar_recharge()
 
-    if not any([exercises, sleep_data, recharge_data]):
-        await update.message.reply_text("❌ Новые данные в Polar не найдены.")
+    if not any([exercises_raw, sleep_raw, activity_raw, recharge_raw]):
+        await update.message.reply_text("❌ Новые данные в Polar не найдены или ошибка токена.")
         return
 
-    # Группировка данных по датам
     grouped_data = {}
-    
-    # Обработка тренировок
-    if exercises and isinstance(exercises, dict):
-        for ex in exercises.get("exercises", []):
-            # Пытаемся достать дату из тренировки (Polar отдает в start-time)
-            date_str = ex.get("start-time", "")[:10] 
+
+    # Вспомогательная функция для безопасного извлечения списка
+    def get_list(data, key):
+        if isinstance(data, list): return data
+        if isinstance(data, dict): return data.get(key, [])
+        return []
+
+    # 2. Тренировки
+    for ex in get_list(exercises_raw, "exercises"):
+        if isinstance(ex, dict):
+            date_str = ex.get("start-time", "")[:10] or ex.get("date", "")
             if date_str:
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 if "exercises" not in grouped_data[date_str]: grouped_data[date_str]["exercises"] = []
                 grouped_data[date_str]["exercises"].append(ex)
 
-    # Обработка сна
-    if sleep_data and isinstance(sleep_data, dict):
-        for sl in sleep_data.get("nights", []):
+    # 3. Сон
+    for sl in get_list(sleep_raw, "nights"):
+        if isinstance(sl, dict):
             date_str = sl.get("date", "")
             if date_str:
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 grouped_data[date_str]["sleep"] = sl
                 
-    # Обработка восстановления
-    if recharge_data and isinstance(recharge_data, dict):
-        for rec in recharge_data.get("recharges", []):
+    # 4. Активность
+    for act in get_list(activity_raw, "activity-transactions"):
+        if isinstance(act, dict):
+            date_str = act.get("date", "")
+            if date_str:
+                if date_str not in grouped_data: grouped_data[date_str] = {}
+                grouped_data[date_str]["activity"] = act
+
+    # 5. Восстановление
+    for rec in get_list(recharge_raw, "recharges"):
+        if isinstance(rec, dict):
             date_str = rec.get("date", "")
             if date_str:
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 grouped_data[date_str]["recharge"] = rec
 
-    # Сохраняем в глобальную базу и на Диск
+    # Сохраняем в базу и на Диск
     if grouped_data:
         training_database.update(grouped_data)
         save_json_to_drive(TRAINING_FILE_NAME, training_database)
         await update.message.reply_text(f"✅ Синхронизация завершена! Добавлены данные за {len(grouped_data)} дней. База обновлена.")
     else:
-        await update.message.reply_text("⚠️ Данные получены, но не удалось распознать даты. Формат ответа Polar мог измениться.")
+        await update.message.reply_text("⚠️ Данные получены, но не удалось распознать даты. Возможно, структура ответа Polar изменилась.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global chat_history
@@ -247,9 +279,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ошибка: DEEPSEEK_API_KEY не задан.")
         return
 
-    # Добавляем сообщение в историю
     chat_history.append({"role": "user", "content": user_text})
-    recent_context = chat_history[-10:] # Храним только 10 последних реплик для диалога
+    recent_context = chat_history[-10:]
 
     messages = [
         {"role": "system", "content": system_instruction},
@@ -257,27 +288,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     try:
-        # Первый запрос к DeepSeek: разрешаем ему использовать инструменты (Tools)
         response = ai_client.chat.completions.create(
             model="deepseek-flash",
             messages=messages,
             tools=tools,
-            tool_choice="auto" # DeepSeek сам решит, когда вызвать функцию
+            tool_choice="auto"
         )
 
         response_message = response.choices[0].message
         
-        # Проверяем, решил ли DeepSeek вызвать функцию поиска по датам
         if response_message.tool_calls:
             function_name = response_message.tool_calls[0].function.name
             if function_name == "get_training_data_by_date":
                 args = json.loads(response_message.tool_calls[0].function.arguments)
-                
-                # Вызываем нашу функцию и получаем отфильтрованные данные
                 function_response = get_training_data_by_date(args["start_date"], args["end_date"])
                 
-                # Добавляем ответ функции в контекст для DeepSeek
-                messages.append(response_message) # Сообщение с tool_calls
+                messages.append(response_message)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": response_message.tool_calls[0].id,
@@ -285,7 +311,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "content": function_response
                 })
                 
-                # Второй запрос: DeepSeek анализирует полученные данные и пишет ответ
                 second_response = ai_client.chat.completions.create(
                     model="deepseek-flash",
                     messages=messages
@@ -294,13 +319,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 bot_reply = "Произошла ошибка при выборе инструмента."
         else:
-            # Если инструменты не нужны, просто берем текстовый ответ
             bot_reply = response_message.content
 
-        # Сохраняем ответ в историю
         chat_history.append({"role": "assistant", "content": bot_reply})
-        
-        # Синхронизируем историю диалога на Диск (чтобы не потерялась при рестарте)
         save_json_to_drive(CHAT_FILE_NAME, {"history": chat_history})
 
         await update.message.reply_text(bot_reply)
