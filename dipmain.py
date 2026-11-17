@@ -122,29 +122,19 @@ training_database = {}
 chat_history = []      
 
 # ================================
-# POLAR ACCESSLINK INTEGRATION (Точно как в старом коде)
+# POLAR ACCESSLINK INTEGRATION
 # ================================
 def fetch_polar_data(endpoint):
-    """Универсальная функция для запросов к Polar AccessLink API."""
-    if not POLAR_ACCESS_TOKEN:
-        print("⚠️ POLAR_ACCESS_TOKEN не настроен.")
-        return None
-
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"
-    }
+    if not POLAR_ACCESS_TOKEN: return None
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"}
     url = f"https://www.polaraccesslink.com/v3/{endpoint}"
-
     try:
         response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"⚠️ Polar API ({endpoint}) ответил с кодом {response.status_code}: {response.text}")
-            return None
+        if response.status_code == 200: return response.json()
+        print(f"⚠️ Polar API ({endpoint}) ответил с кодом {response.status_code}: {response.text}")
+        return None
     except Exception as e:
-        print(f"❌ Ошибка при запросе к Polar AccessLink API ({endpoint}): {e}")
+        print(f"❌ Ошибка Polar API ({endpoint}): {e}")
         return None
 
 def fetch_polar_exercises(): return fetch_polar_data("exercises")
@@ -208,51 +198,55 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global training_database
     await update.message.reply_text("⏳ Запрашиваю данные из Polar Flow (тренировки, сон, активность, восстановление)...")
     
-    # Забираем всё точно так же, как в рабочем коде для Gemini
-    exercises = fetch_polar_exercises()
-    sleep_data = fetch_polar_sleep()
-    activity_data = fetch_polar_activity()
-    recharge_data = fetch_polar_recharge()
+    exercises_raw = fetch_polar_exercises()
+    sleep_raw = fetch_polar_sleep()
+    activity_raw = fetch_polar_activity()
+    recharge_raw = fetch_polar_recharge()
 
-    if not any([exercises, sleep_data, activity_data, recharge_data]):
-        await update.message.reply_text("❌ Новые данные в Polar не найдены или возникла ошибка доступа.")
+    if not any([exercises_raw, sleep_raw, activity_raw, recharge_raw]):
+        await update.message.reply_text("❌ Новые данные в Polar не найдены или ошибка доступа.")
         return
 
-    # Сохраняем сырые данные в словарь по датам
     grouped_data = {}
-    
-    def get_list(data, key):
-        if isinstance(data, list): return data
-        if isinstance(data, dict): return data.get(key, [])
+
+    # --- ОБРАБОТКА СПИСКОВ И СЛОВАРЕЙ (Универсальный парсер) ---
+    def extract_items(data, key=None):
+        if isinstance(data, list): 
+            return data
+        if isinstance(data, dict) and key and key in data: 
+            return data[key]
+        if isinstance(data, dict) and "exercises" in data and isinstance(data["exercises"], list): 
+            return data["exercises"] # Fallback для тренировок
         return []
 
-    # Тренировки
-    for ex in get_list(exercises, "exercises"):
+    # 1. Тренировки (теперь обрабатывает и список, и словарь)
+    for ex in extract_items(exercises_raw, "exercises"):
         if isinstance(ex, dict):
-            date_str = ex.get("start-time", "")[:10] or ex.get("date", "")
+            # Polar отдает start_time (UTC), берем первые 10 символов (YYYY-MM-DD)
+            date_str = ex.get("start_time", "")[:10] or ex.get("start-time", "")[:10]
             if date_str:
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 if "exercises" not in grouped_data[date_str]: grouped_data[date_str]["exercises"] = []
                 grouped_data[date_str]["exercises"].append(ex)
 
-    # Сон
-    for sl in get_list(sleep_data, "nights"):
+    # 2. Сон
+    for sl in extract_items(sleep_raw, "nights"):
         if isinstance(sl, dict):
             date_str = sl.get("date", "")
             if date_str:
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 grouped_data[date_str]["sleep"] = sl
                 
-    # Активность
-    for act in get_list(activity_data, "activity-transactions"):
+    # 3. Активность
+    for act in extract_items(activity_raw, "activity-transactions"):
         if isinstance(act, dict):
             date_str = act.get("date", "")
             if date_str:
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 grouped_data[date_str]["activity"] = act
 
-    # Восстановление
-    for rec in get_list(recharge_data, "recharges"):
+    # 4. Восстановление
+    for rec in extract_items(recharge_raw, "recharges"):
         if isinstance(rec, dict):
             date_str = rec.get("date", "")
             if date_str:
@@ -263,17 +257,16 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         training_database.update(grouped_data)
         save_json_to_drive(TRAINING_FILE_NAME, training_database)
         
-        report_details = []
-        if exercises: report_details.append("тренировки")
-        if sleep_data: report_details.append("сон")
-        if activity_data: report_details.append("активность")
-        if recharge_data: report_details.append("восстановление")
+        # Проверяем, есть ли тренировки в обновленных данных
+        has_exercises = any("exercises" in day_data for day_data in grouped_data.values())
         
-        synced_types = ", ".join(report_details)
-        await update.message.reply_text(
-            f"✅ Синхронизация завершена!\nУспешно получены данные: {synced_types}.\n"
-            f"База обновлена (всего дней: {len(training_database)})."
-        )
+        msg = f"✅ Синхронизация завершена!\nБаза обновлена (всего дней: {len(training_database)})."
+        if has_exercises:
+            msg += "\n🏃‍♂️ Тренировки успешно распознаны и добавлены."
+        else:
+            msg += "\n⚠️ Тренировки не найдены (возможно, Polar не отдает их или они записаны как активность)."
+            
+        await update.message.reply_text(msg)
     else:
         await update.message.reply_text("⚠️ Данные получены, но не удалось распознать даты. Возможно, структура ответа Polar изменилась.")
 
@@ -349,7 +342,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 bot_reply = second_response.choices[0].message.content
             else:
-                bot_reply = "Не удалось распознать даты в запросе. Попробуй сформулировать иначе (например: 'Отчет с 2026-11-01 по 2026-11-15')."
+                bot_reply = "Не удалось распознать даты в запросе. Попробуй сформулировать иначе."
 
         chat_history.append({"role": "assistant", "content": bot_reply})
         save_json_to_drive(CHAT_FILE_NAME, {"history": chat_history})
