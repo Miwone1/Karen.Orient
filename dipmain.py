@@ -122,19 +122,29 @@ training_database = {}
 chat_history = []      
 
 # ================================
-# POLAR ACCESSLINK INTEGRATION
+# POLAR ACCESSLINK INTEGRATION (Точно как в старом коде)
 # ================================
 def fetch_polar_data(endpoint):
-    if not POLAR_ACCESS_TOKEN: return None
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"}
+    """Универсальная функция для запросов к Polar AccessLink API."""
+    if not POLAR_ACCESS_TOKEN:
+        print("⚠️ POLAR_ACCESS_TOKEN не настроен.")
+        return None
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {POLAR_ACCESS_TOKEN}"
+    }
     url = f"https://www.polaraccesslink.com/v3/{endpoint}"
+
     try:
         response = requests.get(url, headers=headers)
-        if response.status_code == 200: return response.json()
-        print(f"⚠️ Polar API ({endpoint}) ответил с кодом {response.status_code}: {response.text}")
-        return None
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"⚠️ Polar API ({endpoint}) ответил с кодом {response.status_code}: {response.text}")
+            return None
     except Exception as e:
-        print(f"❌ Ошибка Polar API ({endpoint}): {e}")
+        print(f"❌ Ошибка при запросе к Polar AccessLink API ({endpoint}): {e}")
         return None
 
 def fetch_polar_exercises(): return fetch_polar_data("exercises")
@@ -145,7 +155,6 @@ def fetch_polar_recharge(): return fetch_polar_data("users/nightly-recharge")
 # ================================
 # TELEGRAM & DEEPSEEK LOGIC
 # ================================
-# Указываем текущую дату и правила, чтобы модель не выдумывала годы
 current_date = datetime.now().strftime("%Y-%m-%d")
 system_instruction = (
     "Ты — персональный AI-тренер по лыжному ориентированию, лыжным гонкам и трейлраннингу. "
@@ -153,12 +162,11 @@ system_instruction = (
     "поддерживающим, анализируй нагрузки, пульсовые зоны, подготовку инвентаря (парафины, Fischer Speedmax, Bliz) "
     "и соревновательную тактику. "
     f"ВАЖНО: Сегодня {current_date}. Если пользователь просит 'последнюю тренировку' или 'отчет за период', "
-    "используй функцию get_training_data_by_date с правильными датами. Не выдумывай даты из прошлых лет."
+    "используй функцию get_training_data_by_date с правильными датами."
 )
 
 ai_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com") if DEEPSEEK_API_KEY else None
 
-# Описание инструментов
 tools = [{
     "type": "function",
     "function": {
@@ -200,23 +208,26 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global training_database
     await update.message.reply_text("⏳ Запрашиваю данные из Polar Flow (тренировки, сон, активность, восстановление)...")
     
-    exercises_raw = fetch_polar_exercises()
-    sleep_raw = fetch_polar_sleep()
-    activity_raw = fetch_polar_activity()
-    recharge_raw = fetch_polar_recharge()
+    # Забираем всё точно так же, как в рабочем коде для Gemini
+    exercises = fetch_polar_exercises()
+    sleep_data = fetch_polar_sleep()
+    activity_data = fetch_polar_activity()
+    recharge_data = fetch_polar_recharge()
 
-    if not any([exercises_raw, sleep_raw, activity_raw, recharge_raw]):
-        await update.message.reply_text("❌ Новые данные в Polar не найдены или ошибка токена.")
+    if not any([exercises, sleep_data, activity_data, recharge_data]):
+        await update.message.reply_text("❌ Новые данные в Polar не найдены или возникла ошибка доступа.")
         return
 
+    # Сохраняем сырые данные в словарь по датам
     grouped_data = {}
-
+    
     def get_list(data, key):
         if isinstance(data, list): return data
         if isinstance(data, dict): return data.get(key, [])
         return []
 
-    for ex in get_list(exercises_raw, "exercises"):
+    # Тренировки
+    for ex in get_list(exercises, "exercises"):
         if isinstance(ex, dict):
             date_str = ex.get("start-time", "")[:10] or ex.get("date", "")
             if date_str:
@@ -224,21 +235,24 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if "exercises" not in grouped_data[date_str]: grouped_data[date_str]["exercises"] = []
                 grouped_data[date_str]["exercises"].append(ex)
 
-    for sl in get_list(sleep_raw, "nights"):
+    # Сон
+    for sl in get_list(sleep_data, "nights"):
         if isinstance(sl, dict):
             date_str = sl.get("date", "")
             if date_str:
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 grouped_data[date_str]["sleep"] = sl
                 
-    for act in get_list(activity_raw, "activity-transactions"):
+    # Активность
+    for act in get_list(activity_data, "activity-transactions"):
         if isinstance(act, dict):
             date_str = act.get("date", "")
             if date_str:
                 if date_str not in grouped_data: grouped_data[date_str] = {}
                 grouped_data[date_str]["activity"] = act
 
-    for rec in get_list(recharge_raw, "recharges"):
+    # Восстановление
+    for rec in get_list(recharge_data, "recharges"):
         if isinstance(rec, dict):
             date_str = rec.get("date", "")
             if date_str:
@@ -248,19 +262,26 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if grouped_data:
         training_database.update(grouped_data)
         save_json_to_drive(TRAINING_FILE_NAME, training_database)
-        await update.message.reply_text(f"✅ Синхронизация завершена! Добавлены данные за {len(grouped_data)} дней. База обновлена.")
+        
+        report_details = []
+        if exercises: report_details.append("тренировки")
+        if sleep_data: report_details.append("сон")
+        if activity_data: report_details.append("активность")
+        if recharge_data: report_details.append("восстановление")
+        
+        synced_types = ", ".join(report_details)
+        await update.message.reply_text(
+            f"✅ Синхронизация завершена!\nУспешно получены данные: {synced_types}.\n"
+            f"База обновлена (всего дней: {len(training_database)})."
+        )
     else:
         await update.message.reply_text("⚠️ Данные получены, но не удалось распознать даты. Возможно, структура ответа Polar изменилась.")
 
-# Функция для ручного парсинга галлюцинаций DeepSeek (теги <|DSML|>)
 def parse_dsml_text(text):
     if "<|DSML|" not in text:
         return None
-    
-    # Ищем аргументы
     start_match = re.search(r'name="start_date"[^>]*>([^<]+)', text)
     end_match = re.search(r'name="end_date"[^>]*>([^<]+)', text)
-    
     if start_match and end_match:
         return start_match.group(1).strip(), end_match.group(1).strip()
     return None
@@ -282,9 +303,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     try:
-        # ИСПОЛЬЗУЕМ deepseek-chat, так как он лучше работает с Function Calling
         response = ai_client.chat.completions.create(
-            model="deepseek-chat", 
+            model="deepseek-chat",
             messages=messages,
             tools=tools,
             tool_choice="auto"
@@ -293,7 +313,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response_message = response.choices[0].message
         bot_reply = response_message.content or ""
         
-        # 1. Штатная обработка вызова функции
         if response_message.tool_calls:
             function_name = response_message.tool_calls[0].function.name
             if function_name == "get_training_data_by_date":
@@ -314,7 +333,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 bot_reply = second_response.choices[0].message.content
         
-        # 2. Защита от галлюцинаций (если модель вернула теги в виде текста)
         elif "<|DSML|" in bot_reply:
             print("⚠️ Обнаружены DSML-теги в тексте. Пытаемся распарсить...")
             parsed_dates = parse_dsml_text(bot_reply)
@@ -322,7 +340,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 start_date, end_date = parsed_dates
                 function_response = get_training_data_by_date(start_date, end_date)
                 
-                # Отправляем данные обратно модели
                 messages.append({"role": "assistant", "content": bot_reply})
                 messages.append({"role": "user", "content": f"Вот данные, которые ты запросил:\n{function_response}\n\nПожалуйста, проанализируй их и ответь пользователю."})
                 
